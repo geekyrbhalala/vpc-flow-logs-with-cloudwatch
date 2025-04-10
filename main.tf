@@ -154,44 +154,49 @@ resource "aws_instance" "public-ec2" {
 }
 
 resource "aws_cloudwatch_log_group" "loggroup" {
-  name = "VPCFlowLogs"
+  name = "VPCFlowLogsEC2"
 }
 
 # Create an IAM Role for VPC Flow Logs to publish logs to CloudWatch
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["vpc-flow-logs.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
 resource "aws_iam_role" "vpc_flow_logs_role" {
-  name = "vpc-flow-logs-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = "sts:AssumeRole"
-      Principal = {
-        Service = "vpc-flow-logs.amazonaws.com"
-      }
-    }]
-  })
+  name               = "vpc-flow-logs-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
 }
 
 # Attach the policy to the IAM Role
-resource "aws_iam_role_policy" "vpc_flow_logs_role_policy" {
-  name = "vpc-flow-logs-policy"
-  role = aws_iam_role.vpc_flow_logs_role.name
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogGroups",
-          "logs:DescribeLogStreams"
-        ]
-        Resource = aws_cloudwatch_log_group.loggroup.arn
-      }
+data "aws_iam_policy_document" "policy_doc" {
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      "logs:DescribeLogGroups",
+      "logs:DescribeLogStreams",
     ]
-  })
+
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "vpc_flow_logs_role_policy" {
+  name   = "vpc-flow-logs-policy"
+  role   = aws_iam_role.vpc_flow_logs_role.name
+  policy = data.aws_iam_policy_document.policy_doc.json
 }
 
 resource "aws_flow_log" "eni_flowlogs_with_cloudwatch" {
@@ -203,25 +208,126 @@ resource "aws_flow_log" "eni_flowlogs_with_cloudwatch" {
 }
 
 resource "aws_cloudwatch_log_metric_filter" "only_my_public_ip" {
-  name           = "VPCFlowLogs_OnlyMyIPAddress"
+  name           = "VPCFlowLogsOnlyMyIPAddress"
   pattern        = "REJECT"
   log_group_name = aws_cloudwatch_log_group.loggroup.name
 
   metric_transformation {
-    namespace = "ns-onlymyipaddress"
-    name      = "Reject-count"
+    namespace = "ns-unauthorizedipaddressEc2"
+    name      = "RejectIPBlock"
     value     = 1
+    # dimensions = {
+    #   IPAddress = "$.sourceIP"
+    # }
   }
 }
 
+resource "aws_iam_role" "lambda_execution_role" {
+  name = "LambdaExecutionRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Effect = "Allow"
+        Sid    = ""
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_execution_policy" {
+  name = "LambdaExecutionPolicy"
+  role = aws_iam_role.lambda_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action   = "sns:Publish"
+        Resource = "*"
+        Effect   = "Allow"
+      },
+      {
+        Action   = "logs:CreateLogGroup"
+        Resource = "*"
+        Effect   = "Allow"
+      },
+      {
+        Action   = "logs:CreateLogStream"
+        Resource = "*"
+        Effect   = "Allow"
+      },
+      {
+        Action   = "logs:PutLogEvents"
+        Resource = "*"
+        Effect   = "Allow"
+      },
+      {
+        Action   = "ec2:AuthorizeSecurityGroupIngress"
+        Resource = aws_security_group.sg-for-ec2.arn
+        Effect   = "Allow"
+      },
+      {
+        Action   = "ec2:RevokeSecurityGroupIngress"
+        Resource = aws_security_group.sg-for-ec2.arn
+        Effect   = "Allow"
+      },
+      {
+        Action   = "ec2:DescribeInstances"
+        Resource = "*"
+        Effect   = "Allow"
+      }
+    ]
+  })
+}
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  output_path = "lambda.zip"
+
+  source {
+    content  = file("block_ip.py")
+    filename = "block_ip.py"
+  }
+}
+
+# Create the Lambda function that sends alerts
+resource "aws_lambda_function" "block_ip_from_alarm_func" {
+  function_name = "BlockIP"
+  role          = aws_iam_role.lambda_execution_role.arn
+  handler       = "block_ip.lambda_handler"
+  runtime       = "python3.12"
+  filename      = data.archive_file.lambda_zip.output_path
+
+  environment {
+    variables = {
+      SECURITY_GROUP_ID = aws_security_group.sg-for-ec2.id
+    }
+  }
+}
+
+resource "aws_sns_topic" "alarm_topic" {
+  name = "UnauthorizedAccessTopic"
+}
+
+resource "aws_sns_topic_subscription" "lambda_subscription" {
+  topic_arn = aws_sns_topic.alarm_topic.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.block_ip_from_alarm_func.arn # Lambda ARN
+}
+
 resource "aws_cloudwatch_metric_alarm" "denied_access_to_ec2_alarm" {
-  alarm_name          = "Denied-Access-To-EC2"
+  alarm_name          = "Denied-Access-EC2"
   comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 5
+  evaluation_periods  = 1
   metric_name         = aws_cloudwatch_log_metric_filter.only_my_public_ip.metric_transformation.0.name
   namespace           = aws_cloudwatch_log_metric_filter.only_my_public_ip.metric_transformation.0.namespace
   period              = 60
   statistic           = "Sum"
-  threshold           = 1
-  alarm_description   = "If someone tries to access ec2 instance and failed 5 times within 1 minutes then block that IP address"
+  threshold           = 5
+  alarm_actions       = [aws_sns_topic.alarm_topic.arn]
 }
